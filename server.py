@@ -1,140 +1,143 @@
-# server.py
-
-import json
-import os
-from typing import Any, Dict
-
+from typing import List, Dict, Any
 from fastmcp import FastMCP
-import google.generativeai as genai
 
-from prompts import PACKAGER_SYSTEM_PROMPT, build_user_content
-
-
-# -----------------------------
-# Gemini configuration
-# -----------------------------
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-if not GEMINI_API_KEY:
-    raise RuntimeError("GEMINI_API_KEY environment variable is required")
-
-genai.configure(api_key=GEMINI_API_KEY)
-
-GEMINI_MODEL_NAME = "gemini-2.5-flash"
-
-# -----------------------------
-# MCP server
-# -----------------------------
-mcp = FastMCP("chat-prompt-packager")
+# Create MCP server instance
+mcp = FastMCP("simple-chat-structurer")
 
 
-def _sanitize_setting(value: str, allowed: list, default: str) -> str:
-    v = (value or "").strip().lower()
-    return v if v in allowed else default
-
-
-def _safe_parse_json(raw: str) -> Dict[str, Any]:
-    text = raw.strip()
-
-    # Strip ```json fences if present
-    if text.startswith("```"):
-        lines = text.split("\n")
-        if lines and lines[0].startswith("```"):
-            lines = lines[1:]
-        if lines and lines[-1].startswith("```"):
-            lines = lines[:-1]
-        text = "\n".join(lines).strip()
-
-        if text.lower().startswith("json"):
-            text = text[4:].strip()
-
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        start = text.find("{")
-        end = text.rfind("}")
-        if start != -1 and end != -1 and end > start:
-            candidate = text[start : end + 1]
-            try:
-                return json.loads(candidate)
-            except json.JSONDecodeError:
-                pass
-
-    return {
-        "error": "Model did not return valid JSON",
-        "raw": raw,
+def _detect_role(line: str) -> str:
+    """
+    Try to detect the role from a line prefix like:
+    'USER:', 'ASSISTANT:', 'SYSTEM:', 'HUMAN:', 'BOT:'.
+    If none match, return 'unknown'.
+    """
+    prefixes = {
+        "USER:": "user",
+        "ASSISTANT:": "assistant",
+        "SYSTEM:": "system",
+        "HUMAN:": "user",
+        "BOT:": "assistant",
     }
+
+    for prefix, role in prefixes.items():
+        if line.startswith(prefix):
+            return role
+
+    return "unknown"
+
+
+def _strip_role_prefix(line: str) -> str:
+    """
+    Remove known role prefixes from the beginning of a line.
+    """
+    prefixes = [
+        "USER:",
+        "ASSISTANT:",
+        "SYSTEM:",
+        "HUMAN:",
+        "BOT:",
+    ]
+
+    for prefix in prefixes:
+        if line.startswith(prefix):
+            return line[len(prefix) :].lstrip()
+
+    return line
 
 
 @mcp.tool
-def build_prompt_package(
-    raw_chat: str,
-    detail_level: str = "medium",
-    max_examples: int = 3,
-    tone: str = "neutral",
-    target_use: str = "single_prompt",
-    language: str = "en",
-) -> Dict[str, Any]:
+def process_chat(raw_chat: str) -> Dict[str, Any]:
     """
-    Main tool: given the full conversation and settings, call Gemini 2.0 Flash to:
-      - Summarize the conversation
-      - Extract structured context
-      - Pick examples
-      - Build a reusable final prompt
+    Take the full conversation as raw text and return a structured JSON view.
 
-    Returns:
-      {
-        "summary": "...",
-        "context": {...},
-        "examples": [...],
-        "final_prompt": "...",
-        "usage_notes": "..."
+    Input:
+      raw_chat: Full conversation as plain text, usually lines like:
+        SYSTEM: ...
+        USER: ...
+        ASSISTANT: ...
+
+    Output (JSON object):
+    {
+      "raw_chat": "original text",
+      "clean_chat": "normalized text",
+      "messages": [
+        {
+          "role": "user" | "assistant" | "system" | "unknown",
+          "content": "message text (without role prefix)",
+          "original_line": "original line with role prefix if present"
+        },
+        ...
+      ],
+      "stats": {
+        "word_count": <int>,
+        "line_count": <int>,
+        "message_count": <int>
       }
-      or an error object.
+    }
+
+    This tool does not call any external APIs or models.
+    It only cleans and structures the text, then returns JSON.
     """
 
     if not raw_chat or not raw_chat.strip():
-        return {"error": "raw_chat is empty"}
+        return {
+            "raw_chat": raw_chat or "",
+            "clean_chat": "",
+            "messages": [],
+            "stats": {
+                "word_count": 0,
+                "line_count": 0,
+                "message_count": 0,
+            },
+        }
 
-    detail_level = _sanitize_setting(detail_level, ["short", "medium", "long"], "medium")
-    tone = _sanitize_setting(tone, ["neutral", "friendly", "formal"], "neutral")
-    target_use = _sanitize_setting(target_use, ["system_prompt", "single_prompt"], "single_prompt")
+    # Normalize newlines
+    text = raw_chat.replace("\r\n", "\n").replace("\r", "\n")
 
-    try:
-        max_examples_int = int(max_examples)
-    except Exception:
-        max_examples_int = 3
-    max_examples_int = max(0, min(max_examples_int, 10))
+    # Split into lines and trim right whitespace
+    lines = [line.rstrip() for line in text.split("\n")]
 
-    user_content, _ = build_user_content(
-        raw_chat=raw_chat,
-        detail_level=detail_level,
-        max_examples=max_examples_int,
-        tone=tone,
-        target_use=target_use,
-        language=language,
-    )
+    # Remove leading/trailing completely empty lines
+    while lines and not lines[0].strip():
+        lines.pop(0)
+    while lines and not lines[-1].strip():
+        lines.pop()
 
-    try:
-        model = genai.GenerativeModel(
-            model_name=GEMINI_MODEL_NAME,
-            system_instruction=PACKAGER_SYSTEM_PROMPT,
+    # Build clean_chat (non-empty lines joined with single newlines)
+    non_empty_lines = [line for line in lines if line.strip()]
+    clean_chat = "\n".join(non_empty_lines)
+
+    # Build structured messages
+    messages: List[Dict[str, Any]] = []
+    for line in non_empty_lines:
+        stripped = line.strip()
+        role = _detect_role(stripped)
+        content = _strip_role_prefix(stripped)
+
+        messages.append(
+            {
+                "role": role,
+                "content": content,
+                "original_line": stripped,
+            }
         )
 
-        response = model.generate_content(
-            user_content,
-            generation_config={"temperature": 0.2},
-        )
+    word_count = len(clean_chat.split()) if clean_chat else 0
+    line_count = len(non_empty_lines)
+    message_count = len(messages)
 
-        raw_output = (response.text or "").strip()
-        if not raw_output:
-            return {"error": "Gemini returned empty response"}
-
-        data = _safe_parse_json(raw_output)
-        return data
-
-    except Exception as e:
-        return {"error": f"Exception while calling Gemini: {str(e)}"}
+    return {
+        "raw_chat": raw_chat,
+        "clean_chat": clean_chat,
+        "messages": messages,
+        "stats": {
+            "word_count": word_count,
+            "line_count": line_count,
+            "message_count": message_count,
+        },
+    }
 
 
 if __name__ == "__main__":
+    # Local testing: python server.py
     mcp.run()

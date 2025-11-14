@@ -13,7 +13,7 @@ mcp = FastMCP("overleaf-mcp")
 
 # Overleaf configuration
 OVERLEAF_GIT_URL = os.environ.get("OVERLEAF_GIT_URL")
-OVERLEAF_EMAIL = os.environ.get("OVERLEAF_EMAIL")  # only for commit identity
+OVERLEAF_EMAIL = os.environ.get("OVERLEAF_EMAIL")  # only for commit metadata
 OVERLEAF_TOKEN = os.environ.get("OVERLEAF_TOKEN")
 
 
@@ -41,7 +41,7 @@ def run(cmd, cwd=None):
 
 def clone_overleaf_repo() -> Path:
     """
-    Clone the Overleaf Git repository using Git authentication token.
+    Clone the Overleaf Git repository using the Git auth token.
 
     OVERLEAF_GIT_URL should be the plain project URL, e.g.:
         https://git.overleaf.com/<project-id>
@@ -89,9 +89,8 @@ def clone_overleaf_repo() -> Path:
 
 def normalize_latex_content(s: str) -> str:
     """
-    Fix common escaping issues coming from tool calls, especially '\\n'
-    being used as a literal instead of a linebreak after '\\'.
-
+    Fix common escaping issues from tool calls, especially '\\n' being used
+    as a literal instead of a linebreak after '\\'.
     Example:
         '...May 2026\\\\nMaster...' -> '...May 2026\\\\\\nMaster...'
     """
@@ -109,7 +108,7 @@ def _latex_preview(text: str) -> str:
     lines = text.splitlines()
     out: list[str] = []
 
-    section_cmds = ["section", "subsection", "subsubsection", "cvsection", "chapter"]
+    section_cmds = ["section", "subsection", "subsubsection", "cvsection", "chapter", "sect"]
 
     for line in lines:
         stripped = line.strip()
@@ -124,7 +123,7 @@ def _latex_preview(text: str) -> str:
         if stripped.startswith("\\begin{document}") or stripped.startswith("\\end{document}"):
             continue
 
-        # Section-like commands: \section{Title}, \section*{Title}, etc.
+        # Section-like commands: \section{Title}, \sect{Title}, etc.
         m = re.match(r"\\([a-zA-Z]+)\*?\{([^}]*)\}", stripped)
         if m and m.group(1) in section_cmds:
             title = m.group(2).strip()
@@ -180,50 +179,6 @@ def read_overleaf_file(
 
 
 @mcp.tool
-def update_overleaf_file(
-    path: str,
-    new_content: str,
-    commit_message: str = "Update file via Overleaf MCP",
-) -> str:
-    """
-    Update a file in the Overleaf project and push changes.
-    This overwrites the entire file.
-    """
-    try:
-        repo_dir = clone_overleaf_repo()
-    except Exception as e:
-        return f"Git clone failed:\n{e}"
-
-    file_path = repo_dir / path
-
-    # Normalize content to fix '\\n' artifacts
-    new_content = normalize_latex_content(new_content)
-
-    file_path.parent.mkdir(parents=True, exist_ok=True)
-    file_path.write_text(new_content, encoding="utf-8")
-
-    # Git identity (email is only for metadata; does not affect auth)
-    email = OVERLEAF_EMAIL or "overleaf-mcp@example.com"
-    run(["git", "config", "user.name", "Overleaf MCP Bot"], cwd=repo_dir)
-    run(["git", "config", "user.email", email], cwd=repo_dir)
-
-    # Add + commit
-    run(["git", "add", path], cwd=repo_dir)
-    try:
-        run(["git", "commit", "-m", commit_message], cwd=repo_dir)
-    except RuntimeError:
-        return "No changes to commit; file is unchanged."
-
-    # Push (try main, then master)
-    try:
-        run(["git", "push", "origin", "main"], cwd=repo_dir)
-    except RuntimeError:
-        run(["git", "push", "origin", "master"], cwd=repo_dir)
-
-    return f"Successfully updated '{path}' and pushed to Overleaf."
-
-
-@mcp.tool
 def list_overleaf_files() -> list[str]:
     """
     List all files in the Overleaf project (recursively).
@@ -261,10 +216,27 @@ def update_overleaf_section(
     """
     Replace ONLY the body of a LaTeX section with a given title, and push changes.
 
-    Example:
-        path = "ARYAN-PANDIT-RESUME-2/dothis.tex"
-        section_title = "Experience"
-        heading_command = "section"  (matches \\section{Experience} or \\section*{Experience})
+    This is the ONLY write tool. It:
+      - Reads the file.
+      - Finds the matching section header.
+      - Replaces only the body of that section.
+      - Leaves everything else in the file untouched.
+
+    Parameters
+    ----------
+    path : str
+        File to edit, e.g. "test.tex" or "ARYAN-PANDIT-RESUME-2/dothis.tex".
+    section_title : str
+        The exact title of the section, e.g. "PROJECTS", "TECHNICAL SKILLS".
+    heading_command : str
+        The LaTeX command used for the section header.
+        Examples:
+          - "section"  -> matches \section{PROJECTS}
+          - "sect"     -> matches \sect{PROJECTS} (your resume macro)
+    new_section_body : str
+        New content for that section (LaTeX). Only the body is replaced.
+    commit_message : str | None
+        Optional git commit message.
     """
     try:
         repo_dir = clone_overleaf_repo()
@@ -280,10 +252,14 @@ def update_overleaf_section(
     heading_cmd_escaped = re.escape(heading_command)
     title_escaped = re.escape(section_title)
 
+    # Match:
+    #   \sect{TITLE}<whitespace>BODY_UP_TO_NEXT_SECTION_OR_END
+    # or
+    #   \section{TITLE}...
     pattern = (
-        rf"(\\{heading_cmd_escaped}\*?\{{{title_escaped}\}}\s*)"  # header
-        rf"(.*?)"                                                # body
-        rf"(?=("                                                 # stop before next header/end
+        rf"(\\{heading_cmd_escaped}\*?\{{{title_escaped}\}}\s*)"  # group 1: header
+        rf"(.*?)"                                                # group 2: body
+        rf"(?=("                                                 # lookahead: stop before next header/end
         rf"\\{heading_cmd_escaped}\b|"
         rf"\\section\b|"
         rf"\\subsection\b|"
@@ -294,7 +270,7 @@ def update_overleaf_section(
     )
     regex = re.compile(pattern, re.DOTALL)
 
-    # Normalize new section body before inserting
+    # Normalize new section body before inserting (fix \n issues)
     new_section_body = normalize_latex_content(new_section_body)
 
     def replacer(match: re.Match) -> str:

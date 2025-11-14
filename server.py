@@ -37,7 +37,7 @@ def clone_overleaf_repo() -> Path:
     # Auth URL: https://email:token@git.overleaf.com/<project-id>
     auth_url = OVERLEAF_GIT_URL.replace(
         "https://",
-        f"https://{OVERLEAF_EMAIL}:{OVERLEAF_TOKEN}@"
+        f"https://{OVERLEAF_EMAIL}:{OVERLEAF_TOKEN}"
     )
 
     run(["git", "clone", auth_url, str(repo_dir)])

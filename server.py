@@ -1,143 +1,126 @@
-from typing import List, Dict, Any
+import os
+import subprocess
+import tempfile
+from pathlib import Path
+
 from fastmcp import FastMCP
 
-# Create MCP server instance
-mcp = FastMCP("simple-chat-structurer")
+# MCP server instance (FastMCP Cloud entrypoint: server.py:mcp)
+mcp = FastMCP("overleaf-mcp")
+
+# Overleaf configuration from environment
+OVERLEAF_GIT_URL = os.environ.get("OVERLEAF_GIT_URL")
+OVERLEAF_EMAIL = os.environ.get("OVERLEAF_EMAIL")
+OVERLEAF_TOKEN = os.environ.get("OVERLEAF_TOKEN")
 
 
-def _detect_role(line: str) -> str:
+def run(cmd, cwd=None):
+    """Run a shell command and raise if it fails."""
+    subprocess.check_call(cmd, cwd=cwd)
+
+
+def clone_overleaf_repo() -> Path:
     """
-    Try to detect the role from a line prefix like:
-    'USER:', 'ASSISTANT:', 'SYSTEM:', 'HUMAN:', 'BOT:'.
-    If none match, return 'unknown'.
+    Clone the Overleaf Git repo into a temp dir and return the repo path.
+    Uses HTTPS with email + personal access token.
     """
-    prefixes = {
-        "USER:": "user",
-        "ASSISTANT:": "assistant",
-        "SYSTEM:": "system",
-        "HUMAN:": "user",
-        "BOT:": "assistant",
-    }
+    if not OVERLEAF_GIT_URL or not OVERLEAF_EMAIL or not OVERLEAF_TOKEN:
+        raise RuntimeError(
+            "Missing Overleaf configuration. "
+            "Set OVERLEAF_GIT_URL, OVERLEAF_EMAIL, and OVERLEAF_TOKEN env vars."
+        )
 
-    for prefix, role in prefixes.items():
-        if line.startswith(prefix):
-            return role
+    # Create temp dir for this operation
+    tmpdir = tempfile.TemporaryDirectory()
+    repo_dir = Path(tmpdir.name) / "project"
 
-    return "unknown"
+    # Auth URL: https://email:token@git.overleaf.com/<project-id>
+    auth_url = OVERLEAF_GIT_URL.replace(
+        "https://",
+        f"https://{OVERLEAF_EMAIL}:{OVERLEAF_TOKEN}@"
+    )
 
+    run(["git", "clone", auth_url, str(repo_dir)])
 
-def _strip_role_prefix(line: str) -> str:
-    """
-    Remove known role prefixes from the beginning of a line.
-    """
-    prefixes = [
-        "USER:",
-        "ASSISTANT:",
-        "SYSTEM:",
-        "HUMAN:",
-        "BOT:",
-    ]
-
-    for prefix in prefixes:
-        if line.startswith(prefix):
-            return line[len(prefix) :].lstrip()
-
-    return line
+    # Keep the TemporaryDirectory alive by attaching it
+    repo_dir._tmpdir = tmpdir  # type: ignore[attr-defined]
+    return repo_dir
 
 
 @mcp.tool
-def process_chat(raw_chat: str) -> Dict[str, Any]:
+def read_overleaf_file(path: str = "main.tex") -> str:
     """
-    Take the full conversation as raw text and return a structured JSON view.
+    Read a file from the Overleaf project and return its content as text.
 
-    Input:
-      raw_chat: Full conversation as plain text, usually lines like:
-        SYSTEM: ...
-        USER: ...
-        ASSISTANT: ...
+    Parameters
+    ----------
+    path : str
+        Relative path to the file inside the Overleaf repo (default: 'main.tex').
 
-    Output (JSON object):
-    {
-      "raw_chat": "original text",
-      "clean_chat": "normalized text",
-      "messages": [
-        {
-          "role": "user" | "assistant" | "system" | "unknown",
-          "content": "message text (without role prefix)",
-          "original_line": "original line with role prefix if present"
-        },
-        ...
-      ],
-      "stats": {
-        "word_count": <int>,
-        "line_count": <int>,
-        "message_count": <int>
-      }
-    }
-
-    This tool does not call any external APIs or models.
-    It only cleans and structures the text, then returns JSON.
+    Returns
+    -------
+    str
+        File content, or an error message if the file does not exist.
     """
+    repo_dir = clone_overleaf_repo()
+    file_path = repo_dir / path
 
-    if not raw_chat or not raw_chat.strip():
-        return {
-            "raw_chat": raw_chat or "",
-            "clean_chat": "",
-            "messages": [],
-            "stats": {
-                "word_count": 0,
-                "line_count": 0,
-                "message_count": 0,
-            },
-        }
+    if not file_path.exists():
+        return f"File '{path}' does not exist in the Overleaf project."
 
-    # Normalize newlines
-    text = raw_chat.replace("\r\n", "\n").replace("\r", "\n")
+    return file_path.read_text(encoding="utf-8")
 
-    # Split into lines and trim right whitespace
-    lines = [line.rstrip() for line in text.split("\n")]
 
-    # Remove leading/trailing completely empty lines
-    while lines and not lines[0].strip():
-        lines.pop(0)
-    while lines and not lines[-1].strip():
-        lines.pop()
+@mcp.tool
+def update_overleaf_file(
+    path: str,
+    new_content: str,
+    commit_message: str = "Update file via Overleaf MCP",
+) -> str:
+    """
+    Overwrite a file in the Overleaf project with new content and push changes.
 
-    # Build clean_chat (non-empty lines joined with single newlines)
-    non_empty_lines = [line for line in lines if line.strip()]
-    clean_chat = "\n".join(non_empty_lines)
+    Parameters
+    ----------
+    path : str
+        Relative path to the file inside the Overleaf repo (e.g., 'main.tex').
+    new_content : str
+        New content to write into the file.
+    commit_message : str
+        Git commit message.
 
-    # Build structured messages
-    messages: List[Dict[str, Any]] = []
-    for line in non_empty_lines:
-        stripped = line.strip()
-        role = _detect_role(stripped)
-        content = _strip_role_prefix(stripped)
+    Returns
+    -------
+    str
+        Status message.
+    """
+    repo_dir = clone_overleaf_repo()
+    file_path = repo_dir / path
 
-        messages.append(
-            {
-                "role": role,
-                "content": content,
-                "original_line": stripped,
-            }
-        )
+    # Ensure parent directory exists
+    file_path.parent.mkdir(parents=True, exist_ok=True)
+    file_path.write_text(new_content, encoding="utf-8")
 
-    word_count = len(clean_chat.split()) if clean_chat else 0
-    line_count = len(non_empty_lines)
-    message_count = len(messages)
+    # Set git identity
+    run(["git", "config", "user.name", "Overleaf MCP Bot"], cwd=repo_dir)
+    run(["git", "config", "user.email", OVERLEAF_EMAIL], cwd=repo_dir)
 
-    return {
-        "raw_chat": raw_chat,
-        "clean_chat": clean_chat,
-        "messages": messages,
-        "stats": {
-            "word_count": word_count,
-            "line_count": line_count,
-            "message_count": message_count,
-        },
-    }
+    run(["git", "add", path], cwd=repo_dir)
+
+    # Commit (if there are changes)
+    try:
+        run(["git", "commit", "-m", commit_message], cwd=repo_dir)
+    except subprocess.CalledProcessError:
+        return "No changes to commit; file content is unchanged."
+
+    # Push to 'main', fall back to 'master' if needed
+    try:
+        run(["git", "push", "origin", "main"], cwd=repo_dir)
+    except subprocess.CalledProcessError:
+        run(["git", "push", "origin", "master"], cwd=repo_dir)
+
+    return f"Successfully updated '{path}' and pushed to Overleaf."
 
 
 if __name__ == "__main__":
-    # Local testing: python server.py
     mcp.run()

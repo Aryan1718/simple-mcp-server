@@ -40,11 +40,7 @@ def run(cmd, cwd=None):
 def clone_overleaf_repo() -> Path:
     """
     Clone the Overleaf Git repository using Git authentication token.
-
-    OVERLEAF_GIT_URL should be the plain project URL, e.g.:
-        https://git.overleaf.com/68e0943728ec5e06663c86fe
-
-    OVERLEAF_TOKEN is your Git authentication token from Overleaf.
+    Returns only the repo path without attaching tmpdir to it.
     """
     if not OVERLEAF_GIT_URL or not OVERLEAF_TOKEN:
         raise RuntimeError(
@@ -55,20 +51,22 @@ def clone_overleaf_repo() -> Path:
     if not OVERLEAF_GIT_URL.startswith("https://"):
         raise RuntimeError("OVERLEAF_GIT_URL must start with https://")
 
-    # Temporary directory
+    # Create temp dir and store it globally to prevent cleanup
     tmpdir = tempfile.TemporaryDirectory()
     repo_dir = Path(tmpdir.name) / "project"
 
-    # Parse the base URL (e.g. https://git.overleaf.com/<project-id>)
-    parsed = urlparse(OVERLEAF_GIT_URL)
-    if not parsed.hostname:
-        raise RuntimeError(f"Invalid OVERLEAF_GIT_URL: {OVERLEAF_GIT_URL}")
+    # Save the tmpdir to a global list to prevent automatic deletion
+    # (FastMCP keeps the server alive, so this is safe)
+    if "_TMPDIRS" not in globals():
+        globals()["_TMPDIRS"] = []
+    globals()["_TMPDIRS"].append(tmpdir)
 
-    # Overleaf expects: username "git", password = token.
-    # We embed that as: https://git:<token>@git.overleaf.com/<project-id>
+    # Parse base URL
+    parsed = urlparse(OVERLEAF_GIT_URL)
     user = "git"
     password = quote(OVERLEAF_TOKEN, safe="")
 
+    # Build netloc: git:TOKEN@git.overleaf.com
     host = parsed.hostname
     netloc = f"{user}:{password}@{host}"
     if parsed.port:
@@ -76,11 +74,8 @@ def clone_overleaf_repo() -> Path:
 
     auth_url = urlunparse(parsed._replace(netloc=netloc))
 
-    # Perform git clone
     run(["git", "clone", auth_url, str(repo_dir)])
 
-    # Keep temp directory alive
-    repo_dir._tmpdir = tmpdir  # type: ignore[attr-defined]
     return repo_dir
 
 

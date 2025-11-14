@@ -4,6 +4,7 @@ import tempfile
 from pathlib import Path
 from urllib.parse import urlparse, urlunparse, quote
 import re
+from typing import Optional
 
 from fastmcp import FastMCP
 
@@ -43,7 +44,7 @@ def clone_overleaf_repo() -> Path:
     Clone the Overleaf Git repository using Git authentication token.
 
     OVERLEAF_GIT_URL should be the plain project URL, e.g.:
-        https://git.overleaf.com/68e0....
+        https://git.overleaf.com/<project-id>
 
     OVERLEAF_TOKEN is your Git authentication token from Overleaf.
     """
@@ -84,6 +85,17 @@ def clone_overleaf_repo() -> Path:
     run(["git", "clone", auth_url, str(repo_dir)])
 
     return repo_dir
+
+
+def normalize_latex_content(s: str) -> str:
+    """
+    Fix common escaping issues coming from tool calls, especially '\\n'
+    being used as a literal instead of a linebreak after '\\'.
+
+    Example:
+        '...May 2026\\\\nMaster...' -> '...May 2026\\\\\\nMaster...'
+    """
+    return s.replace("\\n", "\\\n")
 
 
 def _latex_preview(text: str) -> str:
@@ -127,7 +139,7 @@ def _latex_preview(text: str) -> str:
             out.append(f"- {content}")
             continue
 
-        # Default: include line as-is (this may still contain some LaTeX, but less noise)
+        # Default: include line as-is
         out.append(stripped)
 
     return "\n".join(out).strip()
@@ -147,7 +159,7 @@ def read_overleaf_file(
         Relative path to the file inside the Overleaf repo.
     raw : bool
         If True, return full LaTeX source.
-        If False, return a human-friendly preview (no full preamble/boilerplate).
+        If False, return a human-friendly preview.
     """
     try:
         repo_dir = clone_overleaf_repo()
@@ -183,6 +195,9 @@ def update_overleaf_file(
         return f"Git clone failed:\n{e}"
 
     file_path = repo_dir / path
+
+    # Normalize content to fix '\\n' artifacts
+    new_content = normalize_latex_content(new_content)
 
     file_path.parent.mkdir(parents=True, exist_ok=True)
     file_path.write_text(new_content, encoding="utf-8")
@@ -241,7 +256,7 @@ def update_overleaf_section(
     section_title: str,
     new_section_body: str,
     heading_command: str = "section",
-    commit_message: str | None = None,
+    commit_message: Optional[str] = None,
 ) -> str:
     """
     Replace ONLY the body of a LaTeX section with a given title, and push changes.
@@ -278,6 +293,9 @@ def update_overleaf_section(
         rf"))"
     )
     regex = re.compile(pattern, re.DOTALL)
+
+    # Normalize new section body before inserting
+    new_section_body = normalize_latex_content(new_section_body)
 
     def replacer(match: re.Match) -> str:
         header = match.group(1)
